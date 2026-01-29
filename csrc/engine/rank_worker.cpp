@@ -249,35 +249,95 @@ void RankWorker::thread_loop() {
                         auto logits{model_->forward(model_args).logits};
                         // Random sampling (rank 0 only)
                         if (rank_info_.tp_rank == 0) {
-                            auto temperature{local_args.temperature};
-                            auto top_p{local_args.top_p};
-                            auto top_k{local_args.top_k};
-                            auto random_val{local_args.random_val};
+                            // Check if sampling parameters are provided
+                            bool has_sampling = local_args.temperature.has_value() ||
+                                                local_args.top_k.has_value() ||
+                                                local_args.top_p.has_value();
 
-                            const auto &logits_shape{logits->shape()};
-                            const auto &vocab_size{logits_shape[2]};
-                            const auto &total_len{logits_shape[1]};
-                            const auto &batch_size{logits_shape[0]};
+                            if (!has_sampling) {
+                                // No sampling parameters: return logits directly
+                                output_ = Output{.output_ids = std::nullopt, .logits = logits};
+                            } else {
+                                // Sampling requested: check if input_offsets is available
+                                if (!local_args.input_offsets.has_value()) {
+                                    // Simple case: single request without input_offsets
+                                    // Use the last token of each sequence in the batch
+                                    auto temperature{local_args.temperature};
+                                    auto top_p{local_args.top_p};
+                                    auto top_k{local_args.top_k};
+                                    auto random_val{local_args.random_val};
 
-                            auto n_req = local_args.input_offsets.value()->size(0) - 1;
-                            int64_t *input_offsets = (int64_t *)local_args.input_offsets.value()->data();
+                                    const auto &logits_shape{logits->shape()};
+                                    const auto &vocab_size{logits_shape[2]};
+                                    const auto &total_len{logits_shape[1]};
+                                    const auto &batch_size{logits_shape[0]};
 
-                            auto output_ids{infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device)};
+                                    auto output_ids{infinicore::Tensor::empty({batch_size}, infinicore::DataType::I64, rank_info_.device)};
 
-                            for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
-                                auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
-                                auto out{output_ids->narrow({{0, i, 1}})->view({})};
-                                infinicore::op::random_sample_(
-                                    out, score, random_val, top_p, top_k, temperature);
+                                    for (auto i{decltype(batch_size)(0)}; i < batch_size; ++i) {
+                                        // Get the last token's logits for this sequence
+                                        auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(i * total_len + total_len - 1), 1}})->view({vocab_size})};
+
+                                        // Ensure the tensor is contiguous before passing to random_sample_
+                                        if (!score->is_contiguous()) {
+                                            score = score->contiguous();
+                                        }
+
+                                        auto out{output_ids->narrow({{0, i, 1}})->view({})};
+
+                                        // Ensure the output tensor is also contiguous
+                                        if (!out->is_contiguous()) {
+                                            out = out->contiguous();
+                                        }
+
+                                        infinicore::op::random_sample_(
+                                            out, score, random_val.value_or(0.0f), top_p.value_or(1.0f), top_k.value_or(0), temperature.value_or(1.0f));
+                                    }
+
+                                    output_ids = output_ids->to(infinicore::Device::cpu());
+                                    infinicore::context::syncStream();
+                                    output_ = Output{.output_ids = output_ids, .logits = std::nullopt};
+                                } else {
+                                    // Continuous batching case: use input_offsets
+                                    auto temperature{local_args.temperature};
+                                    auto top_p{local_args.top_p};
+                                    auto top_k{local_args.top_k};
+                                    auto random_val{local_args.random_val};
+
+                                    const auto &logits_shape{logits->shape()};
+                                    const auto &vocab_size{logits_shape[2]};
+                                    const auto &total_len{logits_shape[1]};
+                                    const auto &batch_size{logits_shape[0]};
+
+                                    auto n_req = local_args.input_offsets.value()->size(0) - 1;
+                                    int64_t *input_offsets = (int64_t *)local_args.input_offsets.value()->data();
+
+                                    auto output_ids{infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device)};
+
+                                    for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
+                                        auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
+
+                                        // Ensure the tensor is contiguous before passing to random_sample_
+                                        if (!score->is_contiguous()) {
+                                            score = score->contiguous();
+                                        }
+
+                                        auto out{output_ids->narrow({{0, i, 1}})->view({})};
+
+                                        // Ensure the output tensor is also contiguous
+                                        if (!out->is_contiguous()) {
+                                            out = out->contiguous();
+                                        }
+
+                                        infinicore::op::random_sample_(
+                                            out, score, random_val.value_or(0.0f), top_p.value_or(1.0f), top_k.value_or(0), temperature.value_or(1.0f));
+                                    }
+
+                                    output_ids = output_ids->to(infinicore::Device::cpu());
+                                    infinicore::context::syncStream();
+                                    output_ = Output{.output_ids = output_ids, .logits = std::nullopt};
+                                }
                             }
-
-                            output_ids = output_ids->to(infinicore::Device::cpu());
-
-                            infinicore::context::syncStream();
-
-                            auto out{Output{output_ids}};
-
-                            output_ = std::move(out);
                         }
 
                         job_done_ = true;

@@ -3,7 +3,7 @@ from transformers import AutoTokenizer
 from infinilm.modeling_utils import load_model_state_dict_by_file
 from infinilm.distributed import DistConfig
 from infinilm.infer_engine import GenerationConfig, InferEngine
-from infinilm.cache import StaticKVCacheConfig
+from infinilm.fused_infer_engine import FusedInferEngine
 import argparse
 import sys
 import time
@@ -179,6 +179,11 @@ def get_args():
         action="store_true",
         help="skip loading model weights",
     )
+    parser.add_argument(
+        "--enable-fusion",
+        action="store_true",
+        help="Enable operator fusion optimization",
+    )
     return parser.parse_args()
 
 
@@ -202,16 +207,26 @@ class TestModel:
         infini_device=infinicore.device("cpu", 0),
         tp=1,
         skip_load=False,
+        enable_fusion=False,
     ) -> None:
         model_path = os.path.expanduser(model_path)
         # ---------------------------------------------------------------------------- #
         #                        创建模型,
         # ---------------------------------------------------------------------------- #
-        model = InferEngine(
-            model_path,
-            device=infini_device,
-            distributed_config=DistConfig(tp),
-        )
+        if enable_fusion:
+            print("[Fusion] Operator fusion ENABLED")
+            model = FusedInferEngine(
+                model_path,
+                device=infini_device,
+                distributed_config=DistConfig(tp),
+                enable_fusion=True,
+            )
+        else:
+            model = InferEngine(
+                model_path,
+                device=infini_device,
+                distributed_config=DistConfig(tp),
+            )
 
         # ---------------------------------------------------------------------------- #
         #                        加载权重
@@ -261,7 +276,6 @@ class TestModel:
         output_ids = self.model.generate(
             input_ids_infini,
             GenerationConfig(max_new_tokens=output_len, eos_token_id=[]),
-            _measure_and_log_time=True,
         )
         t2 = time.time()
 
@@ -327,6 +341,7 @@ if __name__ == "__main__":
         infini_device=infini_device,
         tp=tp,
         skip_load=skip_load,
+        enable_fusion=args.enable_fusion,
     )
 
     for idx, case in tqdm(cases_dict.items(), desc="Processing cases"):
@@ -338,11 +353,7 @@ if __name__ == "__main__":
 
         # reset cache for each case
         initial_capacity = input_len + output_len
-        test.model.reset_cache(
-            StaticKVCacheConfig(
-                max_batch_size=batch_size, max_cache_len=initial_capacity
-            )
-        )
+        test.model.reset_cache(batch_size=batch_size, initial_capacity=initial_capacity)
 
         # run test one case
         test.run(

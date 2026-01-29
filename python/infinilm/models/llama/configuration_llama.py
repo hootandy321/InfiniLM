@@ -182,13 +182,10 @@ class LlamaConfig(PretrainedConfig, _infinilm.LlamaConfig):
         mlp_bias=False,
         head_dim=None,
         torch_dtype=None,
+        enable_fusion=True,
         **kwargs,
     ):
         _infinilm.LlamaConfig.__init__(self)
-
-        original_model_type = kwargs.get("model_type", None)
-        if original_model_type == "qwen3":
-            self.qk_norm = True
 
         # ---
         self.model_type = "llama"
@@ -197,6 +194,7 @@ class LlamaConfig(PretrainedConfig, _infinilm.LlamaConfig):
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self.enable_fusion = enable_fusion
         # ---
 
         self.vocab_size = vocab_size

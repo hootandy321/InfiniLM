@@ -4,12 +4,12 @@ from tokenizers import decoders as _dec
 from infinilm.modeling_utils import load_model_state_dict_by_file
 from infinilm.distributed import DistConfig
 from infinilm.infer_engine import GenerationConfig, InferEngine
+from infinilm.fused_infer_engine import FusedInferEngine
 import argparse
 import sys
 import time
 import os
 import numpy as np
-from infinilm.cache import StaticKVCacheConfig, PagedKVCacheConfig
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../python"))
 
@@ -84,9 +84,9 @@ def get_args():
         help="total rank for tensor parallel",
     )
     parser.add_argument(
-        "--enable-paged-attn",
+        "--enable-fusion",
         action="store_true",
-        help="use paged cache",
+        help="Enable operator fusion optimization",
     )
 
     return parser.parse_args()
@@ -98,25 +98,34 @@ def test(
     max_new_tokens=100,
     infini_device=infinicore.device("cpu", 0),
     tp=1,
-    enable_paged_attn=False,
+    enable_fusion=False,
 ):
     model_path = os.path.expanduser(model_path)
     # ---------------------------------------------------------------------------- #
-    #                        Create Model
+    #                        创建模型,
     # ---------------------------------------------------------------------------- #
-    model = InferEngine(
-        model_path,
-        device=infini_device,
-        distributed_config=DistConfig(tp),
-    )
+    if enable_fusion:
+        print("[Fusion] Operator fusion ENABLED")
+        model = FusedInferEngine(
+            model_path,
+            device=infini_device,
+            distributed_config=DistConfig(tp),
+            enable_fusion=True,
+        )
+    else:
+        model = InferEngine(
+            model_path,
+            device=infini_device,
+            distributed_config=DistConfig(tp),
+        )
 
     # ---------------------------------------------------------------------------- #
-    #                        Load Weights
+    #                        加载权重
     # ---------------------------------------------------------------------------- #
     load_model_state_dict_by_file(model, model_path, dtype=model.config.dtype)
 
     # ---------------------------------------------------------------------------- #
-    #                        create tokenizer
+    #                        创建 tokenizer
     # ---------------------------------------------------------------------------- #
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
@@ -139,7 +148,7 @@ def test(
             )
 
     # ---------------------------------------------------------------------------- #
-    #                        tokenize
+    #                        token编码
     # ---------------------------------------------------------------------------- #
     # prompt = "山东最高的山是？"
     if isinstance(prompts, str):
@@ -157,26 +166,14 @@ def test(
         "input_ids"
     ]  # List: [[1, 1128, 526, 366, 29892]]
 
-    # ---------------------------------------------------------------------------- #
-    #                       Create KVCache
-    # ---------------------------------------------------------------------------- #
-    if enable_paged_attn:
-        batch_size = 1 if prompts is str else len(prompts)
-        max_total_tokens = max_new_tokens + len(input_ids_list[0])
-        cache_config = PagedKVCacheConfig(
-            num_blocks=(max_total_tokens // 16 + 1) * batch_size, block_size=16
-        )
-    else:
-        batch_size = 1 if prompts is str else len(prompts)
-        initial_capacity = max_new_tokens + len(input_ids_list[0])
-        cache_config = StaticKVCacheConfig(
-            max_batch_size=batch_size, max_cache_len=initial_capacity
-        )
-
-    model.reset_cache(cache_config)
+    # 根据输入长度和最长输出长度创建KVCache
+    model.reset_cache(
+        1 if prompts is str else len(prompts),
+        max_new_tokens + len(input_ids_list[0]),
+    )
 
     # ---------------------------------------------------------------------------- #
-    #                        Generate
+    #                        自回归生成
     # ---------------------------------------------------------------------------- #
     print(input_contents[0], end="", flush=True)
     input_ids_infini = infinicore.from_list(input_ids_list)
@@ -230,7 +227,7 @@ if __name__ == "__main__":
     max_new_tokens = args.max_new_tokens
     backend = args.backend
     tp = args.tp
-    enable_paged_attn = args.enable_paged_attn
+
     if backend != "cpp":
         raise ValueError(f"Unsupported backend: {backend}.")
 
@@ -242,5 +239,5 @@ if __name__ == "__main__":
         max_new_tokens,
         infini_device=infini_device,
         tp=tp,
-        enable_paged_attn=enable_paged_attn,
+        enable_fusion=args.enable_fusion,
     )
