@@ -19,11 +19,7 @@ class AutoConfig:
                 f"`model_type` is not specified in the config file `{config_path}`."
             )
 
-        if config_dict["model_type"] == "llama":
-            return LlamaConfig(**config_dict)
-        elif (
-            config_dict["model_type"] == "qwen2" or config_dict["model_type"] == "qwen3"
-        ):
+        if config_dict["model_type"] in ["llama", "fm9g"]:
             return LlamaConfig(**config_dict)
 
         raise ValueError(f"Unsupported model type `{config_dict['model_type']}`.")

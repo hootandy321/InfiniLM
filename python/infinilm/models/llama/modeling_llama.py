@@ -22,6 +22,7 @@ import infinicore
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation.utils import GenerationMixin
+from ...fusion_utils import FusionManager, create_swiglu_pattern, create_add_rms_norm_pattern
 from .configuration_llama import LlamaConfig
 
 
@@ -95,6 +96,7 @@ LlamaRMSNorm = infinicore.nn.RMSNorm
 class LlamaMLP(infinicore.nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
+        self.config = config  # Save config for fusion toggle
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
         mlp_bias = config.mlp_bias
@@ -112,6 +114,22 @@ class LlamaMLP(infinicore.nn.Module):
         self.act_fn = infinicore.nn.functional.silu
 
     def forward(self, x: infinicore.Tensor) -> infinicore.Tensor:
+        if hasattr(self.config, "enable_fusion") and self.config.enable_fusion:
+            # 使用融合 SwiGLU: silu(gate) * up
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            
+            # 这里我们通过全局或通过传递的 scheduler 来执行
+            # 为了简单，可以直接在 MLP 中缓存模式
+            if not hasattr(self, "_swiglu_pattern"):
+                self._swiglu_pattern = create_swiglu_pattern()
+            if not hasattr(self, "_scheduler"):
+                from infinicore.fusion import FusionScheduler
+                self._scheduler = FusionScheduler()
+            
+            fused_out = self._scheduler.dispatch(self._swiglu_pattern, {"gate": gate, "up": up})
+            return self.down_proj(fused_out["output"])
+            
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -263,6 +281,7 @@ class LlamaAttention(infinicore.nn.Module):
 class LlamaDecoderLayer(infinicore.nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int, **kwargs):
         super().__init__()
+        self.config = config  # Save config for fusion toggle
         hidden_size = config.hidden_size
         rms_norm_eps = config.rms_norm_eps
         dtype = config.dtype
@@ -307,7 +326,21 @@ class LlamaDecoderLayer(infinicore.nn.Module):
         # ------------------------------------------------ #
         residual = hidden_states
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if hasattr(self.config, "enable_fusion") and self.config.enable_fusion:
+            # 融合 Add + RMSNorm
+            if not hasattr(self, "_add_rms_norm_pattern"):
+                self._add_rms_norm_pattern = create_add_rms_norm_pattern()
+            if not hasattr(self, "_scheduler"):
+                from infinicore.fusion import FusionScheduler
+                self._scheduler = FusionScheduler()
+            
+            fused_out = self._scheduler.dispatch(
+                self._add_rms_norm_pattern, 
+                {"x": hidden_states, "residual": residual, "weight": self.post_attention_layernorm.weight}
+            )
+            hidden_states = fused_out["output"]
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
 
